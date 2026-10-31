@@ -1,4 +1,6 @@
+import os
 import discord
+from discord import app_commands
 from discord.ext import commands
 import aiohttp
 import logging
@@ -16,11 +18,12 @@ logging.getLogger('discord').setLevel(logging.DEBUG)
 
 intents = discord.Intents.default()
 intents.members = True
-intents.message_content = True
 bot = commands.AutoShardedBot(command_prefix='!', intents=intents)  
 
 
-TOKEN = 'ur bot token go here'  
+TOKEN = os.environ.get('DISCORD_TOKEN', '')
+if not TOKEN:
+    raise SystemExit('Set the DISCORD_TOKEN environment variable')  
 
 
 conn = sqlite3.connect('server_configs.db', check_same_thread=False)  
@@ -65,6 +68,60 @@ async def fetch_user_data(user_id):
                 raise
 
 
+async def check_member(member, role, role_name, badge, tag):
+    logger.info(f"Checking user: {member.display_name} | ID: {member.id}")
+    user_data = await fetch_user_data(member.id)
+
+    if user_data and user_data.get('clan'):
+        logger.info(f"User Data for {member.display_name}: {user_data}")
+        clan_data = user_data.get('clan', {})
+        user_badge = str(clan_data.get('badge', '')).strip()
+        user_tag = str(clan_data.get('tag', '')).strip()
+        stored_badge = str(badge).strip()
+        stored_tag = str(tag).strip()
+
+        logger.info(f"Comparing - User Badge: {user_badge} | Stored Badge: {stored_badge} | User Tag: {user_tag} | Stored Tag: {stored_tag}")
+
+        if user_badge == stored_badge and user_tag == stored_tag:
+            if role not in member.roles:
+                logger.info(f"Badge and tag match for {member.display_name}. Adding role '{role_name}'...")
+                await member.add_roles(role)
+                logger.info(f"Successfully added role '{role_name}' to {member.display_name}")
+            else:
+                logger.info(f"User {member.display_name} already has role '{role_name}'")
+        else:
+            if role in member.roles:
+                logger.info(f"Badge or tag does not match for {member.display_name}. Removing role '{role_name}'...")
+                await member.remove_roles(role)
+                logger.info(f"Successfully removed role '{role_name}' from {member.display_name}")
+            else:
+                logger.info(f"User {member.display_name} does not match badge/tag, and does not have role '{role_name}'")
+    else:
+        logger.warning(f"No user data fetched for {member.display_name} (ID: {member.id}). Skipping...")
+
+
+def get_guild_config(guild):
+    cursor.execute("SELECT role_name, badge, tag FROM server_config WHERE guild_id = ?", (str(guild.id),))
+    config = cursor.fetchone()
+    if not config:
+        return None
+    role_name, badge, tag = config
+    role = discord.utils.get(guild.roles, name=role_name)
+    if not role:
+        return None
+    return role, role_name, badge, tag
+
+
+async def check_single_member(member):
+    config = get_guild_config(member.guild)
+    if not config:
+        return
+    try:
+        await check_member(member, *config)
+    except Exception as e:
+        logger.error(f"Error while processing user {member.display_name} (ID: {member.id}): {e}")
+
+
 async def scan_all_users(guild):
     cursor.execute("SELECT role_name, badge, tag FROM server_config WHERE guild_id = ?", (str(guild.id),))
     config = cursor.fetchone()
@@ -95,36 +152,7 @@ async def scan_all_users(guild):
             break
 
         try:
-            logger.info(f"Checking user: {member.display_name} | ID: {member.id}")
-            user_data = await fetch_user_data(member.id)
-
-            if user_data and user_data.get('clan'):
-                logger.info(f"User Data for {member.display_name}: {user_data}")
-                clan_data = user_data.get('clan', {})
-                user_badge = str(clan_data.get('badge', '')).strip()
-                user_tag = str(clan_data.get('tag', '')).strip()
-                stored_badge = str(badge).strip()
-                stored_tag = str(tag).strip()
-
-                logger.info(f"Comparing - User Badge: {user_badge} | Stored Badge: {stored_badge} | User Tag: {user_tag} | Stored Tag: {stored_tag}")
-
-                if user_badge == stored_badge and user_tag == stored_tag:
-                    if role not in member.roles:
-                        logger.info(f"Badge and tag match for {member.display_name}. Adding role '{role_name}'...")
-                        await member.add_roles(role)
-                        logger.info(f"Successfully added role '{role_name}' to {member.display_name}")
-                    else:
-                        logger.info(f"User {member.display_name} already has role '{role_name}'")
-                else:
-                    if role in member.roles:
-                        logger.info(f"Badge or tag does not match for {member.display_name}. Removing role '{role_name}'...")
-                        await member.remove_roles(role)
-                        logger.info(f"Successfully removed role '{role_name}' from {member.display_name}")
-                    else:
-                        logger.info(f"User {member.display_name} does not match badge/tag, and does not have role '{role_name}'")
-            else:
-                logger.warning(f"No user data fetched for {member.display_name} (ID: {member.id}). Skipping...")
-            
+            await check_member(member, role, role_name, badge, tag)
             members_checked += 1
             await asyncio.sleep(delay_per_check)
         except Exception as e:
@@ -134,29 +162,24 @@ async def scan_all_users(guild):
     logger.info(f"Completed scan of {members_checked} members in guild {guild.name}.")
 
 
+RECHECK_COOLDOWN = 60
+last_checked = {}
+
+
 @bot.event
 async def on_member_join(member):
     logger.info(f"New member joined: {member.display_name} (ID: {member.id}) in guild {member.guild.name}")
-    await scan_all_users(member.guild)
+    await check_single_member(member)
 
 @bot.event
 async def on_member_update(before, after):
-    try:
-        before_data = await fetch_user_data(before.id)
-        after_data = await fetch_user_data(after.id)
-
-        before_clan = before_data.get('clan', {})
-        after_clan = after_data.get('clan', {})
-        before_tag = str(before_clan.get('tag', '')).strip()
-        after_tag = str(after_clan.get('tag', '')).strip()
-
-        if before_tag != after_tag:
-            logger.info(f"Tag change detected for {after.display_name} (ID: {after.id}) from '{before_tag}' to '{after_tag}'")
-            await scan_all_users(after.guild)
-        else:
-            logger.info(f"No tag change for {after.display_name} (ID: {after.id})")
-    except Exception as e:
-        logger.error(f"Error in on_member_update for {after.display_name} (ID: {after.id}): {e}")
+    # only re-check the member that changed, at most once per RECHECK_COOLDOWN seconds
+    key = (after.guild.id, after.id)
+    now = time.monotonic()
+    if now - last_checked.get(key, 0) < RECHECK_COOLDOWN:
+        return
+    last_checked[key] = now
+    await check_single_member(after)
 
 def cleanup_invalid_badges():
     cursor.execute("SELECT guild_id, badge FROM server_config WHERE LENGTH(badge) < 3")
@@ -179,7 +202,8 @@ async def on_ready():
         logger.info(f"Shard {shard_id} is ready, handling {len([g for g in bot.guilds if (g.id >> 22) % bot.shard_count == shard_id])} guilds")
 
 @bot.tree.command(name='setup', description='Configure badge, tag, and role for tracking')
-@commands.has_permissions(administrator=True)
+@app_commands.default_permissions(manage_roles=True)
+@app_commands.checks.has_permissions(manage_roles=True)
 async def setup(interaction: discord.Interaction, badge: str, tag: str):
     cleanup_invalid_badges()
     if len(badge) < 3:
@@ -193,7 +217,8 @@ async def setup(interaction: discord.Interaction, badge: str, tag: str):
     logger.info(f"Configuration set for Guild {guild_id}: Badge = {badge}, Tag = {tag}")
 
 @bot.tree.command(name='tagrole', description='Set the role to apply for tagged users')
-@commands.has_permissions(administrator=True)
+@app_commands.default_permissions(manage_roles=True)
+@app_commands.checks.has_permissions(manage_roles=True)
 async def tagrole(interaction: discord.Interaction, role: discord.Role):
     guild_id = str(interaction.guild_id)
     cursor.execute("REPLACE INTO server_config (guild_id, role_name, badge, tag) VALUES (?, ?, (SELECT badge FROM server_config WHERE guild_id = ?), (SELECT tag FROM server_config WHERE guild_id = ?))", (guild_id, role.name, guild_id, guild_id))
@@ -202,7 +227,8 @@ async def tagrole(interaction: discord.Interaction, role: discord.Role):
     logger.info(f"✅Role set to: {role.name} for Guild {guild_id}")
 
 @bot.tree.command(name='forcereload', description='Force a reload of all users in this guild to update roles')
-@commands.has_permissions(administrator=True)
+@app_commands.default_permissions(manage_roles=True)
+@app_commands.checks.has_permissions(manage_roles=True)
 async def forcereload(interaction: discord.Interaction):
     await interaction.response.defer()  
     await scan_all_users(interaction.guild)
@@ -210,14 +236,16 @@ async def forcereload(interaction: discord.Interaction):
     logger.info(f"Force reload completed for guild {interaction.guild.name}.")
 
 @bot.tree.command(name='id', description='Fetches user data from Discord API so you can get the string for /setup')
+@app_commands.default_permissions(manage_roles=True)
+@app_commands.checks.has_permissions(manage_roles=True)
 async def id(interaction: discord.Interaction, user_id: str):
     try:
         user_data = await fetch_user_data(user_id)
         formatted_data = json.dumps(user_data, indent=4)
-        await interaction.response.send_message(f"```json\n{formatted_data}\n```")
+        await interaction.response.send_message(f"```json\n{formatted_data}\n```", ephemeral=True)
         logger.info(f"Data sent for user ID: {user_id}")
     except Exception as e:
-        await interaction.response.send_message(f"Failed to fetch user data: {str(e)}")
+        await interaction.response.send_message(f"Failed to fetch user data: {str(e)}", ephemeral=True)
         logger.error(f"Error fetching data for user ID: {user_id} - {str(e)}")
 
 
